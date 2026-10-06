@@ -1,0 +1,188 @@
+name: Security
+
+# The security gate. Every job either passes or fails the build; nothing here
+# is advisory-only, because a warning nobody must act on is not a gate.
+#
+#   secrets → SAST → dependencies → container image → DAST
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Dependencies rot without any code change, so re-run weekly.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # gitleaks needs history to scan past commits
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Semgrep
+        run: |
+          pip install semgrep==1.97.0
+          semgrep scan \
+            --config p/python \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config .semgrep.yml \
+            --error \
+            --sarif --output semgrep.sarif \
+            backend frontend/src
+
+      - name: Bandit
+        working-directory: backend
+        run: |
+          pip install bandit==1.8.0
+          # Tests deliberately contain weak passwords and assert statements.
+          bandit -r app -ll -f txt --exit-zero-on-skipped
+
+      - name: Upload the SARIF report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  dependencies:
+    name: Dependency scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "20"}
+
+      - name: Audit the Python dependencies
+        working-directory: backend
+        run: |
+          pip install pip-audit==2.7.3
+          pip-audit -r requirements.txt --strict
+
+      - name: Audit the frontend dependencies
+        working-directory: frontend
+        run: |
+          npm install --package-lock-only --no-audit
+          npm audit --audit-level=high
+
+  container:
+    name: Container scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the backend image
+        run: docker build -t tracker-backend:scan ./backend
+
+      - name: Build the frontend image
+        run: docker build -t tracker-frontend:scan ./frontend
+
+      - name: Scan the backend image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: tracker-backend:scan
+          format: table
+          exit-code: "1"                 # fail the build on a real finding
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true           # no point failing on what cannot be patched
+
+      - name: Scan the frontend image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: tracker-frontend:scan
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Scan the repository for misconfiguration
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+  dast:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: [container]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          ./scripts/wait-for.sh http://localhost:8000/health 90
+
+      - name: ZAP baseline scan of the API
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: http://localhost:8000
+          rules_file_name: .zap/rules.tsv
+          cmd_options: "-a -j"
+          fail_action: true
+          allow_issue_writing: false
+
+      - name: Collect the application logs
+        if: always()
+        run: docker compose logs --no-color > compose-logs.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: |
+            report_html.html
+            report_json.json
+            compose-logs.txt
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  gate:
+    name: Security gate
+    runs-on: ubuntu-latest
+    needs: [secrets, sast, dependencies, container, dast]
+    if: always()
+    steps:
+      - name: Fail if any security job failed
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          if echo "$results" | grep -q '"result": *"failure"'; then
+            echo "::error::A security check failed; the build is blocked."
+            exit 1
+          fi
+          echo "All security checks passed."

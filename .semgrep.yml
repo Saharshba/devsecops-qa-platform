@@ -1,0 +1,73 @@
+# Project-specific SAST rules, on top of the public rulesets in security.yml.
+#
+# These encode decisions that are easy to undo by accident and that a generic
+# ruleset cannot know about.
+rules:
+  - id: no-raw-sql-string-formatting
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Build queries with SQLAlchemy expressions or bound parameters. String
+      formatting into SQL is how injection gets in.
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute(f"...")
+          - pattern: $DB.execute("..." % ...)
+          - pattern: $DB.execute("..." + $X)
+          - pattern: text(f"...")
+
+  - id: endpoint-without-authentication
+    languages: [python]
+    severity: WARNING
+    message: >-
+      This route has no dependency on get_current_user or a role gate. If it is
+      meant to be public (health checks, login), add a comment saying so.
+    patterns:
+      - pattern-inside: |
+          @router.$METHOD(...)
+          def $FUNC(...):
+            ...
+      - pattern-not-inside: |
+          @router.$METHOD(...)
+          def $FUNC(..., $USER = Depends($GATE), ...):
+            ...
+      - pattern-not-inside: |
+          @router.$METHOD(..., dependencies=[...], ...)
+          def $FUNC(...):
+            ...
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: ^(?!health$|login$|refresh$).*
+
+  - id: no-hardcoded-secret-default
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A credential must not be a literal outside app/core/config.py, where the
+      placeholder defaults are documented and overridden by the environment.
+    paths:
+      exclude:
+        - "**/config.py"
+        - "**/tests/**"
+        - "**/conftest.py"
+    patterns:
+      - pattern: $KEY = "..."
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)^(secret_key|password|api_key|token|private_key)$
+
+  - id: debug-must-not-be-forced-on
+    languages: [python]
+    severity: ERROR
+    message: "Debug mode leaks stack traces; it must come from the environment."
+    pattern-either:
+      - pattern: uvicorn.run(..., debug=True, ...)
+      - pattern: FastAPI(..., debug=True, ...)
+
+  - id: react-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      dangerouslySetInnerHTML renders user content as markup. Issue titles and
+      comments are user-controlled; render them as text.
+    pattern: dangerouslySetInnerHTML={...}

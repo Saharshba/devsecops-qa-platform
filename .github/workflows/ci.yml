@@ -1,0 +1,209 @@
+name: CI
+
+# Quality gate for every push and pull request:
+#   lint → unit → integration → API → build images → end-to-end → QA report
+# The security gate lives in security.yml and runs in parallel.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff==0.8.4
+      - name: Lint the backend
+        run: ruff check backend
+      - name: Check formatting
+        run: ruff format --check backend
+
+  test:
+    name: Tests (unit · integration · API)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tracker
+          POSTGRES_PASSWORD: tracker_password
+          POSTGRES_DB: tracker_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tracker"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      # The suite runs on SQLite by default (fast, isolated per test). This
+      # step re-runs the integration layer against the real engine so that
+      # anything PostgreSQL-specific is caught before deployment.
+      - name: Unit tests
+        working-directory: backend
+        run: pytest tests/unit --junitxml=reports/unit-junit.xml
+
+      - name: Integration tests
+        working-directory: backend
+        run: pytest tests/integration --junitxml=reports/integration-junit.xml
+
+      - name: API tests
+        working-directory: backend
+        run: pytest tests/api --junitxml=reports/api-junit.xml
+
+      - name: Full suite with coverage
+        working-directory: backend
+        run: |
+          pytest \
+            --cov=app --cov-report=xml:reports/coverage.xml \
+            --cov-report=html:reports/htmlcov \
+            --cov-report=term \
+            --junitxml=reports/junit.xml
+
+      - name: Integration tests against PostgreSQL
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg://tracker:tracker_password@localhost:5432/tracker_test
+        run: pytest tests/integration -q
+
+      - name: Enforce the coverage floor
+        working-directory: backend
+        run: |
+          pip install coverage
+          coverage report --data-file=.coverage --fail-under=85
+
+      - name: Build the QA summary
+        if: always()
+        run: python scripts/qa_report.py --reports backend/reports --output qa-summary.md
+
+      - name: Publish the QA summary
+        if: always()
+        run: cat qa-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            backend/reports/
+            qa-summary.md
+          retention-days: 14
+
+  build:
+    name: Build images
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: tracker-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: tracker-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save the images for the downstream jobs
+        run: |
+          docker save tracker-backend:${{ github.sha }} tracker-frontend:${{ github.sha }} \
+            | gzip > images.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-images
+          path: images.tar.gz
+          retention-days: 1
+
+  e2e:
+    name: End-to-end (Playwright)
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: e2e/package.json
+
+      - name: Start the stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          ./scripts/wait-for.sh http://localhost:8000/health 90
+          ./scripts/wait-for.sh http://localhost:5173 60
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run the end-to-end suite
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://localhost:5173
+          E2E_API_URL: http://localhost:8000
+          E2E_ADMIN_PASSWORD: ChangeMe!123
+        run: npm test
+
+      - name: Collect the application logs
+        if: failure()
+        run: docker compose logs --no-color > compose-logs.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-report
+          path: |
+            e2e/playwright-report/
+            e2e/reports/
+            compose-logs.txt
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

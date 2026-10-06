@@ -1,0 +1,26 @@
+# OWASP ZAP baseline rule configuration.
+# Format: <rule id>	<WARN|IGNORE|FAIL>	<comment>
+#
+# Anything not listed keeps its default action. The entries below are
+# deliberate decisions, each with the reason it is safe for this API.
+
+10015	FAIL	Incomplete or no cache-control header
+10020	FAIL	Missing anti-clickjacking header
+10021	FAIL	Missing X-Content-Type-Options header
+10035	FAIL	Strict-Transport-Security header
+10038	FAIL	Content Security Policy header not set
+10098	FAIL	Cross-domain misconfiguration
+40012	FAIL	Cross-site scripting (reflected)
+40014	FAIL	Cross-site scripting (persistent)
+40018	FAIL	SQL injection
+90022	FAIL	Application error disclosure
+
+# The API serves JSON only and is consumed by a SPA with bearer tokens, so
+# there is no cookie to mark and no form to protect with a CSRF token.
+10054	IGNORE	Cookie without SameSite attribute - no cookies are issued
+10010	IGNORE	Cookie no HttpOnly flag - no cookies are issued
+10202	IGNORE	Absence of anti-CSRF tokens - bearer auth, no cookie session
+
+# TLS is terminated by the ingress in front of this service; the scan runs
+# against plain HTTP inside the compose network.
+10011	IGNORE	Cookie without secure flag - TLS terminates upstream
