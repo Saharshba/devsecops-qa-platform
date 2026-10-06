@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+reports/
+*.db
+node_modules/
+dist/
+playwright-report/
+test-results/
+.env
+
+# macOS
+.DS_Store
