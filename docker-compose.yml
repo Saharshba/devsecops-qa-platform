@@ -1,0 +1,52 @@
+# Secure issue tracker — local stack.
+#
+#   cp .env.example .env  &&  docker compose up --build
+#
+# The same compose file is used by the CI end-to-end and DAST jobs, so what
+# the pipeline scans is what runs locally.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tracker_password}
+      POSTGRES_DB: ${POSTGRES_DB:-tracker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tracker} -d ${POSTGRES_DB:-tracker}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [tracker]
+
+  backend:
+    build: ./backend
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://tracker:tracker_password@postgres:5432/tracker}
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports:
+      - "8000:8000"
+    networks: [tracker]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    depends_on: [backend]
+    ports:
+      - "5173:80"
+    networks: [tracker]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+
+networks:
+  tracker:
+    driver: bridge
